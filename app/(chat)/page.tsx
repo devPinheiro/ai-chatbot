@@ -1,25 +1,55 @@
 import { cookies } from 'next/headers';
 
 import { Chat } from '@/components/chat';
-import { DEFAULT_MODEL_NAME, models } from '@/lib/ai/models';
+import { DEFAULT_CHAT_MODEL } from '@/lib/ai/models';
 import { generateUUID } from '@/lib/utils';
+import { DataStreamHandler } from '@/components/data-stream-handler';
+import { auth } from '../(auth)/auth';
+import { redirect } from 'next/navigation';
 
 export default async function Page() {
+  const session = await auth();
+
+  if (!session) {
+    redirect('/api/auth/guest');
+  }
+
   const id = generateUUID();
 
   const cookieStore = await cookies();
-  const modelIdFromCookie = cookieStore.get('model-id')?.value;
+  const modelIdFromCookie = cookieStore.get('chat-model');
 
-  const selectedModelId =
-    models.find((model) => model.id === modelIdFromCookie)?.id ||
-    DEFAULT_MODEL_NAME;
+  if (!modelIdFromCookie) {
+    return (
+      <>
+        <Chat
+          key={id}
+          id={id}
+          initialMessages={[]}
+          initialChatModel={DEFAULT_CHAT_MODEL}
+          initialVisibilityType="private"
+          isReadonly={false}
+          session={session}
+          autoResume={false}
+        />
+        <DataStreamHandler id={id} />
+      </>
+    );
+  }
 
   return (
-    <Chat
-      key={id}
-      id={id}
-      initialMessages={[]}
-      selectedModelId={selectedModelId}
-    />
+    <>
+      <Chat
+        key={id}
+        id={id}
+        initialMessages={[]}
+        initialChatModel={modelIdFromCookie.value}
+        initialVisibilityType="private"
+        isReadonly={false}
+        session={session}
+        autoResume={false}
+      />
+      <DataStreamHandler id={id} />
+    </>
   );
 }

@@ -1,13 +1,7 @@
 'use client';
 
-import type {
-  Attachment,
-  ChatRequestOptions,
-  CreateMessage,
-  Message,
-} from 'ai';
+import type { Attachment, UIMessage } from 'ai';
 import cx from 'classnames';
-import { motion } from 'framer-motion';
 import type React from 'react';
 import {
   useRef,
@@ -17,35 +11,28 @@ import {
   type Dispatch,
   type SetStateAction,
   type ChangeEvent,
+  memo,
 } from 'react';
 import { toast } from 'sonner';
 import { useLocalStorage, useWindowSize } from 'usehooks-ts';
-
-import { sanitizeUIMessages } from '@/lib/utils';
 
 import { ArrowUpIcon, PaperclipIcon, StopIcon } from './icons';
 import { PreviewAttachment } from './preview-attachment';
 import { Button } from './ui/button';
 import { Textarea } from './ui/textarea';
+import { SuggestedActions } from './suggested-actions';
+import equal from 'fast-deep-equal';
+import type { UseChatHelpers } from '@ai-sdk/react';
+import { AnimatePresence, motion } from 'framer-motion';
+import { ArrowDown } from 'lucide-react';
+import { useScrollToBottom } from '@/hooks/use-scroll-to-bottom';
+import type { VisibilityType } from './visibility-selector';
 
-const suggestedActions = [
-  {
-    title: 'What is the weather',
-    label: 'in San Francisco?',
-    action: 'What is the weather in San Francisco?',
-  },
-  {
-    title: 'Help me draft an essay',
-    label: 'about Silicon Valley',
-    action: 'Help me draft a short essay about Silicon Valley',
-  },
-];
-
-export function MultimodalInput({
+function PureMultimodalInput({
   chatId,
   input,
   setInput,
-  isLoading,
+  status,
   stop,
   attachments,
   setAttachments,
@@ -54,27 +41,21 @@ export function MultimodalInput({
   append,
   handleSubmit,
   className,
+  selectedVisibilityType,
 }: {
   chatId: string;
-  input: string;
-  setInput: (value: string) => void;
-  isLoading: boolean;
+  input: UseChatHelpers['input'];
+  setInput: UseChatHelpers['setInput'];
+  status: UseChatHelpers['status'];
   stop: () => void;
   attachments: Array<Attachment>;
   setAttachments: Dispatch<SetStateAction<Array<Attachment>>>;
-  messages: Array<Message>;
-  setMessages: Dispatch<SetStateAction<Array<Message>>>;
-  append: (
-    message: Message | CreateMessage,
-    chatRequestOptions?: ChatRequestOptions,
-  ) => Promise<string | null | undefined>;
-  handleSubmit: (
-    event?: {
-      preventDefault?: () => void;
-    },
-    chatRequestOptions?: ChatRequestOptions,
-  ) => void;
+  messages: Array<UIMessage>;
+  setMessages: UseChatHelpers['setMessages'];
+  append: UseChatHelpers['append'];
+  handleSubmit: UseChatHelpers['handleSubmit'];
   className?: string;
+  selectedVisibilityType: VisibilityType;
 }) {
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const { width } = useWindowSize();
@@ -89,6 +70,13 @@ export function MultimodalInput({
     if (textareaRef.current) {
       textareaRef.current.style.height = 'auto';
       textareaRef.current.style.height = `${textareaRef.current.scrollHeight + 2}px`;
+    }
+  };
+
+  const resetHeight = () => {
+    if (textareaRef.current) {
+      textareaRef.current.style.height = 'auto';
+      textareaRef.current.style.height = '98px';
     }
   };
 
@@ -130,6 +118,7 @@ export function MultimodalInput({
 
     setAttachments([]);
     setLocalStorageInput('');
+    resetHeight();
 
     if (width && width > 768) {
       textareaRef.current?.focus();
@@ -196,41 +185,49 @@ export function MultimodalInput({
     [setAttachments],
   );
 
+  const { isAtBottom, scrollToBottom } = useScrollToBottom();
+
+  useEffect(() => {
+    if (status === 'submitted') {
+      scrollToBottom();
+    }
+  }, [status, scrollToBottom]);
+
   return (
     <div className="relative w-full flex flex-col gap-4">
+      <AnimatePresence>
+        {!isAtBottom && (
+          <motion.div
+            initial={{ opacity: 0, y: 10 }}
+            animate={{ opacity: 1, y: 0 }}
+            exit={{ opacity: 0, y: 10 }}
+            transition={{ type: 'spring', stiffness: 300, damping: 20 }}
+            className="absolute left-1/2 bottom-28 -translate-x-1/2 z-50"
+          >
+            <Button
+              data-testid="scroll-to-bottom-button"
+              className="rounded-full"
+              size="icon"
+              variant="outline"
+              onClick={(event) => {
+                event.preventDefault();
+                scrollToBottom();
+              }}
+            >
+              <ArrowDown />
+            </Button>
+          </motion.div>
+        )}
+      </AnimatePresence>
+
       {messages.length === 0 &&
         attachments.length === 0 &&
         uploadQueue.length === 0 && (
-          <div className="grid sm:grid-cols-2 gap-2 w-full">
-            {suggestedActions.map((suggestedAction, index) => (
-              <motion.div
-                initial={{ opacity: 0, y: 20 }}
-                animate={{ opacity: 1, y: 0 }}
-                exit={{ opacity: 0, y: 20 }}
-                transition={{ delay: 0.05 * index }}
-                key={`suggested-action-${suggestedAction.title}-${index}`}
-                className={index > 1 ? 'hidden sm:block' : 'block'}
-              >
-                <Button
-                  variant="ghost"
-                  onClick={async () => {
-                    window.history.replaceState({}, '', `/chat/${chatId}`);
-
-                    append({
-                      role: 'user',
-                      content: suggestedAction.action,
-                    });
-                  }}
-                  className="text-left border rounded-xl px-4 py-3.5 text-sm flex-1 gap-1 sm:flex-col w-full h-auto justify-start items-start"
-                >
-                  <span className="font-medium">{suggestedAction.title}</span>
-                  <span className="text-muted-foreground">
-                    {suggestedAction.label}
-                  </span>
-                </Button>
-              </motion.div>
-            ))}
-          </div>
+          <SuggestedActions
+            append={append}
+            chatId={chatId}
+            selectedVisibilityType={selectedVisibilityType}
+          />
         )}
 
       <input
@@ -243,7 +240,10 @@ export function MultimodalInput({
       />
 
       {(attachments.length > 0 || uploadQueue.length > 0) && (
-        <div className="flex flex-row gap-2 overflow-x-scroll items-end">
+        <div
+          data-testid="attachments-preview"
+          className="flex flex-row gap-2 overflow-x-scroll items-end"
+        >
           {attachments.map((attachment) => (
             <PreviewAttachment key={attachment.url} attachment={attachment} />
           ))}
@@ -263,21 +263,26 @@ export function MultimodalInput({
       )}
 
       <Textarea
+        data-testid="multimodal-input"
         ref={textareaRef}
         placeholder="Send a message..."
         value={input}
         onChange={handleInput}
         className={cx(
-          'min-h-[24px] max-h-[calc(75dvh)] overflow-hidden resize-none rounded-xl text-base bg-muted',
+          'min-h-[24px] max-h-[calc(75dvh)] overflow-hidden resize-none rounded-2xl !text-base bg-muted pb-10 dark:border-zinc-700',
           className,
         )}
-        rows={3}
+        rows={2}
         autoFocus
         onKeyDown={(event) => {
-          if (event.key === 'Enter' && !event.shiftKey) {
+          if (
+            event.key === 'Enter' &&
+            !event.shiftKey &&
+            !event.nativeEvent.isComposing
+          ) {
             event.preventDefault();
 
-            if (isLoading) {
+            if (status !== 'ready') {
               toast.error('Please wait for the model to finish its response!');
             } else {
               submitForm();
@@ -286,41 +291,114 @@ export function MultimodalInput({
         }}
       />
 
-      {isLoading ? (
-        <Button
-          className="rounded-full p-1.5 h-fit absolute bottom-2 right-2 m-0.5 border dark:border-zinc-600"
-          onClick={(event) => {
-            event.preventDefault();
-            stop();
-            setMessages((messages) => sanitizeUIMessages(messages));
-          }}
-        >
-          <StopIcon size={14} />
-        </Button>
-      ) : (
-        <Button
-          className="rounded-full p-1.5 h-fit absolute bottom-2 right-2 m-0.5 border dark:border-zinc-600"
-          onClick={(event) => {
-            event.preventDefault();
-            submitForm();
-          }}
-          disabled={input.length === 0 || uploadQueue.length > 0}
-        >
-          <ArrowUpIcon size={14} />
-        </Button>
-      )}
+      <div className="absolute bottom-0 p-2 w-fit flex flex-row justify-start">
+        <AttachmentsButton fileInputRef={fileInputRef} status={status} />
+      </div>
 
-      <Button
-        className="rounded-full p-1.5 h-fit absolute bottom-2 right-11 m-0.5 dark:border-zinc-700"
-        onClick={(event) => {
-          event.preventDefault();
-          fileInputRef.current?.click();
-        }}
-        variant="outline"
-        disabled={isLoading}
-      >
-        <PaperclipIcon size={14} />
-      </Button>
+      <div className="absolute bottom-0 right-0 p-2 w-fit flex flex-row justify-end">
+        {status === 'submitted' ? (
+          <StopButton stop={stop} setMessages={setMessages} />
+        ) : (
+          <SendButton
+            input={input}
+            submitForm={submitForm}
+            uploadQueue={uploadQueue}
+          />
+        )}
+      </div>
     </div>
   );
 }
+
+export const MultimodalInput = memo(
+  PureMultimodalInput,
+  (prevProps, nextProps) => {
+    if (prevProps.input !== nextProps.input) return false;
+    if (prevProps.status !== nextProps.status) return false;
+    if (!equal(prevProps.attachments, nextProps.attachments)) return false;
+    if (prevProps.selectedVisibilityType !== nextProps.selectedVisibilityType)
+      return false;
+
+    return true;
+  },
+);
+
+function PureAttachmentsButton({
+  fileInputRef,
+  status,
+}: {
+  fileInputRef: React.MutableRefObject<HTMLInputElement | null>;
+  status: UseChatHelpers['status'];
+}) {
+  return (
+    <Button
+      data-testid="attachments-button"
+      className="rounded-md rounded-bl-lg p-[7px] h-fit dark:border-zinc-700 hover:dark:bg-zinc-900 hover:bg-zinc-200"
+      onClick={(event) => {
+        event.preventDefault();
+        fileInputRef.current?.click();
+      }}
+      disabled={status !== 'ready'}
+      variant="ghost"
+    >
+      <PaperclipIcon size={14} />
+    </Button>
+  );
+}
+
+const AttachmentsButton = memo(PureAttachmentsButton);
+
+function PureStopButton({
+  stop,
+  setMessages,
+}: {
+  stop: () => void;
+  setMessages: UseChatHelpers['setMessages'];
+}) {
+  return (
+    <Button
+      data-testid="stop-button"
+      className="rounded-full p-1.5 h-fit border dark:border-zinc-600"
+      onClick={(event) => {
+        event.preventDefault();
+        stop();
+        setMessages((messages) => messages);
+      }}
+    >
+      <StopIcon size={14} />
+    </Button>
+  );
+}
+
+const StopButton = memo(PureStopButton);
+
+function PureSendButton({
+  submitForm,
+  input,
+  uploadQueue,
+}: {
+  submitForm: () => void;
+  input: string;
+  uploadQueue: Array<string>;
+}) {
+  return (
+    <Button
+      data-testid="send-button"
+      className="rounded-full p-1.5 h-fit border dark:border-zinc-600"
+      onClick={(event) => {
+        event.preventDefault();
+        submitForm();
+      }}
+      disabled={input.length === 0 || uploadQueue.length > 0}
+    >
+      <ArrowUpIcon size={14} />
+    </Button>
+  );
+}
+
+const SendButton = memo(PureSendButton, (prevProps, nextProps) => {
+  if (prevProps.uploadQueue.length !== nextProps.uploadQueue.length)
+    return false;
+  if (prevProps.input !== nextProps.input) return false;
+  return true;
+});

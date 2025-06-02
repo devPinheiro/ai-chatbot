@@ -1,10 +1,8 @@
 import type { Message } from 'ai';
-import { toast } from 'sonner';
 import { useSWRConfig } from 'swr';
 import { useCopyToClipboard } from 'usehooks-ts';
 
 import type { Vote } from '@/lib/db/schema';
-import { getMessageIdFromAnnotations } from '@/lib/utils';
 
 import { CopyIcon, ThumbDownIcon, ThumbUpIcon } from './icons';
 import { Button } from './ui/button';
@@ -14,8 +12,11 @@ import {
   TooltipProvider,
   TooltipTrigger,
 } from './ui/tooltip';
+import { memo } from 'react';
+import equal from 'fast-deep-equal';
+import { toast } from 'sonner';
 
-export function MessageActions({
+export function PureMessageActions({
   chatId,
   message,
   vote,
@@ -31,8 +32,6 @@ export function MessageActions({
 
   if (isLoading) return null;
   if (message.role === 'user') return null;
-  if (message.toolInvocations && message.toolInvocations.length > 0)
-    return null;
 
   return (
     <TooltipProvider delayDuration={0}>
@@ -43,7 +42,18 @@ export function MessageActions({
               className="py-1 px-2 h-fit text-muted-foreground"
               variant="outline"
               onClick={async () => {
-                await copyToClipboard(message.content as string);
+                const textFromParts = message.parts
+                  ?.filter((part) => part.type === 'text')
+                  .map((part) => part.text)
+                  .join('\n')
+                  .trim();
+
+                if (!textFromParts) {
+                  toast.error("There's no text to copy!");
+                  return;
+                }
+
+                await copyToClipboard(textFromParts);
                 toast.success('Copied to clipboard!');
               }}
             >
@@ -56,17 +66,16 @@ export function MessageActions({
         <Tooltip>
           <TooltipTrigger asChild>
             <Button
+              data-testid="message-upvote"
               className="py-1 px-2 h-fit text-muted-foreground !pointer-events-auto"
               disabled={vote?.isUpvoted}
               variant="outline"
               onClick={async () => {
-                const messageId = getMessageIdFromAnnotations(message);
-
                 const upvote = fetch('/api/vote', {
                   method: 'PATCH',
                   body: JSON.stringify({
                     chatId,
-                    messageId,
+                    messageId: message.id,
                     type: 'up',
                   }),
                 });
@@ -110,17 +119,16 @@ export function MessageActions({
         <Tooltip>
           <TooltipTrigger asChild>
             <Button
+              data-testid="message-downvote"
               className="py-1 px-2 h-fit text-muted-foreground !pointer-events-auto"
               variant="outline"
               disabled={vote && !vote.isUpvoted}
               onClick={async () => {
-                const messageId = getMessageIdFromAnnotations(message);
-
                 const downvote = fetch('/api/vote', {
                   method: 'PATCH',
                   body: JSON.stringify({
                     chatId,
-                    messageId,
+                    messageId: message.id,
                     type: 'down',
                   }),
                 });
@@ -164,3 +172,13 @@ export function MessageActions({
     </TooltipProvider>
   );
 }
+
+export const MessageActions = memo(
+  PureMessageActions,
+  (prevProps, nextProps) => {
+    if (!equal(prevProps.vote, nextProps.vote)) return false;
+    if (prevProps.isLoading !== nextProps.isLoading) return false;
+
+    return true;
+  },
+);

@@ -1,374 +1,338 @@
 import {
-  type Message,
-  StreamData,
-  convertToCoreMessages,
-  streamObject,
+  appendClientMessage,
+  appendResponseMessages,
+  createDataStream,
+  smoothStream,
   streamText,
 } from 'ai';
-import { z } from 'zod';
-
-import { auth } from '@/app/(auth)/auth';
-import { customModel } from '@/lib/ai';
-import { models } from '@/lib/ai/models';
-import { systemPrompt } from '@/lib/ai/prompts';
+import { auth, type UserType } from '@/app/(auth)/auth';
+import { type RequestHints, systemPrompt } from '@/lib/ai/prompts';
 import {
+  createStreamId,
   deleteChatById,
   getChatById,
-  getDocumentById,
+  getMessageCountByUserId,
+  getMessagesByChatId,
+  getStreamIdsByChatId,
   saveChat,
-  saveDocument,
   saveMessages,
-  saveSuggestions,
 } from '@/lib/db/queries';
-import type { Suggestion } from '@/lib/db/schema';
-import {
-  generateUUID,
-  getMostRecentUserMessage,
-  sanitizeResponseMessages,
-} from '@/lib/utils';
-
+import { generateUUID, getTrailingMessageId } from '@/lib/utils';
 import { generateTitleFromUserMessage } from '../../actions';
+import { createDocument } from '@/lib/ai/tools/create-document';
+import { updateDocument } from '@/lib/ai/tools/update-document';
+import { requestSuggestions } from '@/lib/ai/tools/request-suggestions';
+import { getWeather } from '@/lib/ai/tools/get-weather';
+import { isProductionEnvironment } from '@/lib/constants';
+import { myProvider } from '@/lib/ai/providers';
+import { entitlementsByUserType } from '@/lib/ai/entitlements';
+import { postRequestBodySchema, type PostRequestBody } from './schema';
+import { geolocation } from '@vercel/functions';
+import {
+  createResumableStreamContext,
+  type ResumableStreamContext,
+} from 'resumable-stream';
+import { after } from 'next/server';
+import type { Chat } from '@/lib/db/schema';
+import { differenceInSeconds } from 'date-fns';
+import { ChatSDKError } from '@/lib/errors';
 
 export const maxDuration = 60;
 
-type AllowedTools =
-  | 'createDocument'
-  | 'updateDocument'
-  | 'requestSuggestions'
-  | 'getWeather';
+let globalStreamContext: ResumableStreamContext | null = null;
 
-const blocksTools: AllowedTools[] = [
-  'createDocument',
-  'updateDocument',
-  'requestSuggestions',
-];
+function getStreamContext() {
+  if (!globalStreamContext) {
+    try {
+      globalStreamContext = createResumableStreamContext({
+        waitUntil: after,
+      });
+    } catch (error: any) {
+      if (error.message.includes('REDIS_URL')) {
+        console.log(
+          ' > Resumable streams are disabled due to missing REDIS_URL',
+        );
+      } else {
+        console.error(error);
+      }
+    }
+  }
 
-const weatherTools: AllowedTools[] = ['getWeather'];
-
-const allTools: AllowedTools[] = [...blocksTools, ...weatherTools];
+  return globalStreamContext;
+}
 
 export async function POST(request: Request) {
-  const {
-    id,
-    messages,
-    modelId,
-  }: { id: string; messages: Array<Message>; modelId: string } =
-    await request.json();
+  let requestBody: PostRequestBody;
+
+  try {
+    const json = await request.json();
+    requestBody = postRequestBodySchema.parse(json);
+  } catch (_) {
+    return new ChatSDKError('bad_request:api').toResponse();
+  }
+
+  try {
+    const { id, message, selectedChatModel, selectedVisibilityType } =
+      requestBody;
+
+    const session = await auth();
+
+    if (!session?.user) {
+      return new ChatSDKError('unauthorized:chat').toResponse();
+    }
+
+    const userType: UserType = session.user.type;
+
+    const messageCount = await getMessageCountByUserId({
+      id: session.user.id,
+      differenceInHours: 24,
+    });
+
+    if (messageCount > entitlementsByUserType[userType].maxMessagesPerDay) {
+      return new ChatSDKError('rate_limit:chat').toResponse();
+    }
+
+    const chat = await getChatById({ id });
+
+    if (!chat) {
+      const title = await generateTitleFromUserMessage({
+        message,
+      });
+
+      await saveChat({
+        id,
+        userId: session.user.id,
+        title,
+        visibility: selectedVisibilityType,
+      });
+    } else {
+      if (chat.userId !== session.user.id) {
+        return new ChatSDKError('forbidden:chat').toResponse();
+      }
+    }
+
+    const previousMessages = await getMessagesByChatId({ id });
+
+    const messages = appendClientMessage({
+      // @ts-expect-error: todo add type conversion from DBMessage[] to UIMessage[]
+      messages: previousMessages,
+      message,
+    });
+
+    const { longitude, latitude, city, country } = geolocation(request);
+
+    const requestHints: RequestHints = {
+      longitude,
+      latitude,
+      city,
+      country,
+    };
+
+    await saveMessages({
+      messages: [
+        {
+          chatId: id,
+          id: message.id,
+          role: 'user',
+          parts: message.parts,
+          attachments: message.experimental_attachments ?? [],
+          createdAt: new Date(),
+        },
+      ],
+    });
+
+    const streamId = generateUUID();
+    await createStreamId({ streamId, chatId: id });
+
+    const stream = createDataStream({
+      execute: (dataStream) => {
+        const result = streamText({
+          model: myProvider.languageModel(selectedChatModel),
+          system: systemPrompt({ selectedChatModel, requestHints }),
+          messages,
+          maxSteps: 5,
+          experimental_activeTools:
+            selectedChatModel === 'chat-model-reasoning'
+              ? []
+              : [
+                  'getWeather',
+                  'createDocument',
+                  'updateDocument',
+                  'requestSuggestions',
+                ],
+          experimental_transform: smoothStream({ chunking: 'word' }),
+          experimental_generateMessageId: generateUUID,
+          tools: {
+            getWeather,
+            createDocument: createDocument({ session, dataStream }),
+            updateDocument: updateDocument({ session, dataStream }),
+            requestSuggestions: requestSuggestions({
+              session,
+              dataStream,
+            }),
+          },
+          onFinish: async ({ response }) => {
+            if (session.user?.id) {
+              try {
+                const assistantId = getTrailingMessageId({
+                  messages: response.messages.filter(
+                    (message) => message.role === 'assistant',
+                  ),
+                });
+
+                if (!assistantId) {
+                  throw new Error('No assistant message found!');
+                }
+
+                const [, assistantMessage] = appendResponseMessages({
+                  messages: [message],
+                  responseMessages: response.messages,
+                });
+
+                await saveMessages({
+                  messages: [
+                    {
+                      id: assistantId,
+                      chatId: id,
+                      role: assistantMessage.role,
+                      parts: assistantMessage.parts,
+                      attachments:
+                        assistantMessage.experimental_attachments ?? [],
+                      createdAt: new Date(),
+                    },
+                  ],
+                });
+              } catch (_) {
+                console.error('Failed to save chat');
+              }
+            }
+          },
+          experimental_telemetry: {
+            isEnabled: isProductionEnvironment,
+            functionId: 'stream-text',
+          },
+        });
+
+        result.consumeStream();
+
+        result.mergeIntoDataStream(dataStream, {
+          sendReasoning: true,
+        });
+      },
+      onError: () => {
+        return 'Oops, an error occurred!';
+      },
+    });
+
+    const streamContext = getStreamContext();
+
+    if (streamContext) {
+      return new Response(
+        await streamContext.resumableStream(streamId, () => stream),
+      );
+    } else {
+      return new Response(stream);
+    }
+  } catch (error) {
+    if (error instanceof ChatSDKError) {
+      return error.toResponse();
+    }
+  }
+}
+
+export async function GET(request: Request) {
+  const streamContext = getStreamContext();
+  const resumeRequestedAt = new Date();
+
+  if (!streamContext) {
+    return new Response(null, { status: 204 });
+  }
+
+  const { searchParams } = new URL(request.url);
+  const chatId = searchParams.get('chatId');
+
+  if (!chatId) {
+    return new ChatSDKError('bad_request:api').toResponse();
+  }
 
   const session = await auth();
 
-  if (!session || !session.user || !session.user.id) {
-    return new Response('Unauthorized', { status: 401 });
+  if (!session?.user) {
+    return new ChatSDKError('unauthorized:chat').toResponse();
   }
 
-  const model = models.find((model) => model.id === modelId);
+  let chat: Chat;
 
-  if (!model) {
-    return new Response('Model not found', { status: 404 });
+  try {
+    chat = await getChatById({ id: chatId });
+  } catch {
+    return new ChatSDKError('not_found:chat').toResponse();
   }
-
-  const coreMessages = convertToCoreMessages(messages);
-  const userMessage = getMostRecentUserMessage(coreMessages);
-
-  if (!userMessage) {
-    return new Response('No user message found', { status: 400 });
-  }
-
-  const chat = await getChatById({ id });
 
   if (!chat) {
-    const title = await generateTitleFromUserMessage({ message: userMessage });
-    await saveChat({ id, userId: session.user.id, title });
+    return new ChatSDKError('not_found:chat').toResponse();
   }
 
-  await saveMessages({
-    messages: [
-      { ...userMessage, id: generateUUID(), createdAt: new Date(), chatId: id },
-    ],
+  if (chat.visibility === 'private' && chat.userId !== session.user.id) {
+    return new ChatSDKError('forbidden:chat').toResponse();
+  }
+
+  const streamIds = await getStreamIdsByChatId({ chatId });
+
+  if (!streamIds.length) {
+    return new ChatSDKError('not_found:stream').toResponse();
+  }
+
+  const recentStreamId = streamIds.at(-1);
+
+  if (!recentStreamId) {
+    return new ChatSDKError('not_found:stream').toResponse();
+  }
+
+  const emptyDataStream = createDataStream({
+    execute: () => {},
   });
 
-  const streamingData = new StreamData();
+  const stream = await streamContext.resumableStream(
+    recentStreamId,
+    () => emptyDataStream,
+  );
 
-  const result = await streamText({
-    model: customModel(model.apiIdentifier),
-    system: systemPrompt,
-    messages: coreMessages,
-    maxSteps: 5,
-    experimental_activeTools: allTools,
-    tools: {
-      getWeather: {
-        description: 'Get the current weather at a location',
-        parameters: z.object({
-          latitude: z.number(),
-          longitude: z.number(),
-        }),
-        execute: async ({ latitude, longitude }) => {
-          const response = await fetch(
-            `https://api.open-meteo.com/v1/forecast?latitude=${latitude}&longitude=${longitude}&current=temperature_2m&hourly=temperature_2m&daily=sunrise,sunset&timezone=auto`,
-          );
+  /*
+   * For when the generation is streaming during SSR
+   * but the resumable stream has concluded at this point.
+   */
+  if (!stream) {
+    const messages = await getMessagesByChatId({ id: chatId });
+    const mostRecentMessage = messages.at(-1);
 
-          const weatherData = await response.json();
-          return weatherData;
-        },
+    if (!mostRecentMessage) {
+      return new Response(emptyDataStream, { status: 200 });
+    }
+
+    if (mostRecentMessage.role !== 'assistant') {
+      return new Response(emptyDataStream, { status: 200 });
+    }
+
+    const messageCreatedAt = new Date(mostRecentMessage.createdAt);
+
+    if (differenceInSeconds(resumeRequestedAt, messageCreatedAt) > 15) {
+      return new Response(emptyDataStream, { status: 200 });
+    }
+
+    const restoredStream = createDataStream({
+      execute: (buffer) => {
+        buffer.writeData({
+          type: 'append-message',
+          message: JSON.stringify(mostRecentMessage),
+        });
       },
-      createDocument: {
-        description: 'Create a document for a writing activity',
-        parameters: z.object({
-          title: z.string(),
-        }),
-        execute: async ({ title }) => {
-          const id = generateUUID();
-          let draftText = '';
+    });
 
-          streamingData.append({
-            type: 'id',
-            content: id,
-          });
+    return new Response(restoredStream, { status: 200 });
+  }
 
-          streamingData.append({
-            type: 'title',
-            content: title,
-          });
-
-          streamingData.append({
-            type: 'clear',
-            content: '',
-          });
-
-          const { fullStream } = await streamText({
-            model: customModel(model.apiIdentifier),
-            system:
-              'Write about the given topic. Markdown is supported. Use headings wherever appropriate.',
-            prompt: title,
-          });
-
-          for await (const delta of fullStream) {
-            const { type } = delta;
-
-            if (type === 'text-delta') {
-              const { textDelta } = delta;
-
-              draftText += textDelta;
-              streamingData.append({
-                type: 'text-delta',
-                content: textDelta,
-              });
-            }
-          }
-
-          streamingData.append({ type: 'finish', content: '' });
-
-          if (session.user?.id) {
-            await saveDocument({
-              id,
-              title,
-              content: draftText,
-              userId: session.user.id,
-            });
-          }
-
-          return {
-            id,
-            title,
-            content: 'A document was created and is now visible to the user.',
-          };
-        },
-      },
-      updateDocument: {
-        description: 'Update a document with the given description',
-        parameters: z.object({
-          id: z.string().describe('The ID of the document to update'),
-          description: z
-            .string()
-            .describe('The description of changes that need to be made'),
-        }),
-        execute: async ({ id, description }) => {
-          const document = await getDocumentById({ id });
-
-          if (!document) {
-            return {
-              error: 'Document not found',
-            };
-          }
-
-          const { content: currentContent } = document;
-          let draftText = '';
-
-          streamingData.append({
-            type: 'clear',
-            content: document.title,
-          });
-
-          const { fullStream } = await streamText({
-            model: customModel(model.apiIdentifier),
-            system:
-              'You are a helpful writing assistant. Based on the description, please update the piece of writing.',
-            experimental_providerMetadata: {
-              openai: {
-                prediction: {
-                  type: 'content',
-                  content: currentContent,
-                },
-              },
-            },
-            messages: [
-              {
-                role: 'user',
-                content: description,
-              },
-              { role: 'user', content: currentContent },
-            ],
-          });
-
-          for await (const delta of fullStream) {
-            const { type } = delta;
-
-            if (type === 'text-delta') {
-              const { textDelta } = delta;
-
-              draftText += textDelta;
-              streamingData.append({
-                type: 'text-delta',
-                content: textDelta,
-              });
-            }
-          }
-
-          streamingData.append({ type: 'finish', content: '' });
-
-          if (session.user?.id) {
-            await saveDocument({
-              id,
-              title: document.title,
-              content: draftText,
-              userId: session.user.id,
-            });
-          }
-
-          return {
-            id,
-            title: document.title,
-            content: 'The document has been updated successfully.',
-          };
-        },
-      },
-      requestSuggestions: {
-        description: 'Request suggestions for a document',
-        parameters: z.object({
-          documentId: z
-            .string()
-            .describe('The ID of the document to request edits'),
-        }),
-        execute: async ({ documentId }) => {
-          const document = await getDocumentById({ id: documentId });
-
-          if (!document || !document.content) {
-            return {
-              error: 'Document not found',
-            };
-          }
-
-          const suggestions: Array<
-            Omit<Suggestion, 'userId' | 'createdAt' | 'documentCreatedAt'>
-          > = [];
-
-          const { elementStream } = await streamObject({
-            model: customModel(model.apiIdentifier),
-            system:
-              'You are a help writing assistant. Given a piece of writing, please offer suggestions to improve the piece of writing and describe the change. It is very important for the edits to contain full sentences instead of just words. Max 5 suggestions.',
-            prompt: document.content,
-            output: 'array',
-            schema: z.object({
-              originalSentence: z.string().describe('The original sentence'),
-              suggestedSentence: z.string().describe('The suggested sentence'),
-              description: z
-                .string()
-                .describe('The description of the suggestion'),
-            }),
-          });
-
-          for await (const element of elementStream) {
-            const suggestion = {
-              originalText: element.originalSentence,
-              suggestedText: element.suggestedSentence,
-              description: element.description,
-              id: generateUUID(),
-              documentId: documentId,
-              isResolved: false,
-            };
-
-            streamingData.append({
-              type: 'suggestion',
-              content: suggestion,
-            });
-
-            suggestions.push(suggestion);
-          }
-
-          if (session.user?.id) {
-            const userId = session.user.id;
-
-            await saveSuggestions({
-              suggestions: suggestions.map((suggestion) => ({
-                ...suggestion,
-                userId,
-                createdAt: new Date(),
-                documentCreatedAt: document.createdAt,
-              })),
-            });
-          }
-
-          return {
-            id: documentId,
-            title: document.title,
-            message: 'Suggestions have been added to the document',
-          };
-        },
-      },
-    },
-    onFinish: async ({ responseMessages }) => {
-      if (session.user?.id) {
-        try {
-          const responseMessagesWithoutIncompleteToolCalls =
-            sanitizeResponseMessages(responseMessages);
-
-          await saveMessages({
-            messages: responseMessagesWithoutIncompleteToolCalls.map(
-              (message) => {
-                const messageId = generateUUID();
-
-                if (message.role === 'assistant') {
-                  streamingData.appendMessageAnnotation({
-                    messageIdFromServer: messageId,
-                  });
-                }
-
-                return {
-                  id: messageId,
-                  chatId: id,
-                  role: message.role,
-                  content: message.content,
-                  createdAt: new Date(),
-                };
-              },
-            ),
-          });
-        } catch (error) {
-          console.error('Failed to save chat');
-        }
-      }
-
-      streamingData.close();
-    },
-    experimental_telemetry: {
-      isEnabled: true,
-      functionId: 'stream-text',
-    },
-  });
-
-  return result.toDataStreamResponse({
-    data: streamingData,
-  });
+  return new Response(stream, { status: 200 });
 }
 
 export async function DELETE(request: Request) {
@@ -376,28 +340,22 @@ export async function DELETE(request: Request) {
   const id = searchParams.get('id');
 
   if (!id) {
-    return new Response('Not Found', { status: 404 });
+    return new ChatSDKError('bad_request:api').toResponse();
   }
 
   const session = await auth();
 
-  if (!session || !session.user) {
-    return new Response('Unauthorized', { status: 401 });
+  if (!session?.user) {
+    return new ChatSDKError('unauthorized:chat').toResponse();
   }
 
-  try {
-    const chat = await getChatById({ id });
+  const chat = await getChatById({ id });
 
-    if (chat.userId !== session.user.id) {
-      return new Response('Unauthorized', { status: 401 });
-    }
-
-    await deleteChatById({ id });
-
-    return new Response('Chat deleted', { status: 200 });
-  } catch (error) {
-    return new Response('An error occurred while processing your request', {
-      status: 500,
-    });
+  if (chat.userId !== session.user.id) {
+    return new ChatSDKError('forbidden:chat').toResponse();
   }
+
+  const deletedChat = await deleteChatById({ id });
+
+  return Response.json(deletedChat, { status: 200 });
 }
